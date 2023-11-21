@@ -1,0 +1,152 @@
+#! /usr/bin/env python3
+
+# Given a single PMID, output a formatted BibTeX entry.
+#
+# You have to add the citekey yourself, and you may need to do some
+# light editing of things that the script isn't smart enough to do.
+# Check for accented characters on authornames, and capitalization
+# and italics (species names) in titles.
+#
+# Usage:    pmid2bib <pmid>
+# Example:  pmid2bib 13882203
+#
+# This also serves as an example of parsing XML with
+# xml.etree.ElementTree.
+#
+# Sean Eddy (seaneddy@fas.harvard.edu; http://eddylab.org), 11/2023
+
+import sys
+import re
+import urllib.request
+import xml.etree.ElementTree as ET
+
+if len(sys.argv) == 1:
+   sys.exit('pmid2bib: format a BibTeX entry, given a PubMed ID\nUsage: pmid2bib <pmid>')
+if len(sys.argv) != 2:
+   sys.exit('Incorrect number of command line arguments.\nUsage: pmid2bib <pmid>')
+if not re.match(r'^\d+$', sys.argv[1]):
+   sys.exit('"{}" doesn\'t look like a PMID.\nUsage: pmid2bib <pmid>'.format(sys.argv[1]))
+
+pmid       = sys.argv[1]
+efetch_url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={}&rettype=abstract'.format(pmid);
+
+
+# Given the XML's "SR" for initials, convert to "S. R." for BibTeX.
+def format_author_initials(s):
+   initials_formatted = []
+   for c in s: initials_formatted.append('{}.'.format(c))
+   return ' '.join(initials_formatted)
+
+# Given an all-caps surname e.g. "CRICK" or "WATTS-TOBIN", re-capitalize as e.g. "Crick" or "Watts-Tobin"
+def format_author_surname(s):
+   return re.sub(r"([A-Z])([A-Z]+)", lambda m: m.group(1).upper() + m.group(2).lower(), s)
+
+
+# Given the XML's "Title with only the first word capitalized",
+# capitalize throughout to "Title with Only the First Word
+# Capitalized". The style rule is that short prepositions,
+# conjunctions, and articles of four or fewer letters are
+# uncapitalized; here I do it with a simple list of common ones.
+#
+# I also try to recognize some common species names to leave
+# them uncapitalized, but you'll need to add the \emph{} yourself.
+#
+# Also, wrap anything with more than one capital letter
+# in it (example: "RNA") with {} brackets to protect the
+# capitalization in BibTeX.
+#
+# Python's s.title() method does NOT work for this. It converts
+# RNA to Rna, for example.
+#
+def format_title(s):
+   nocap  = ['a', 'an', 'and', 'as', 'at', 'but', 'by', 'for', 'if', 'in', 'nor', 'of', 'off',
+             'on', 'or', 'up', 'so', 'the', 'to', 'up', 'via', 'with', 'yet']
+   common_species = ['cerevisiae', 'coli', 'elegans', 'furiosus', 'melanogaster', 'musculus', 'sapiens']
+   twords = []
+   nw     = 0
+   s      = s.rstrip('.')
+   for w in s.split(' '):
+      nw += 1
+      extracaps = sum(1 for c in w[1:] if c.isupper())
+      if   extracaps:              twords.append('{{{}}}'.format(w))
+      elif nw == 1:                twords.append(w)
+      elif w[0].isupper():         twords.append('{{{}}}{}'.format(w[0], w[1:]))
+      elif w in nocap:             twords.append(w)
+      elif w in common_species:    twords.append(w)
+      else:                        twords.append(w.capitalize())
+   return ' '.join(twords)
+
+
+# Given the XML's official ISO abbreviation for the journal, typically
+# without any .'s, return the abbreviation that I use.  This is just
+# an enumerated list of journals, and it's incomplete; I'll add to it
+# over time.
+#
+def format_journal(s):
+   journal_map = {
+      'Curr Biol':                'Curr. Biol.',
+      'Elife':                    'eLife',
+      'Nat Rev Genet':            'Nat. Rev. Genet.',
+      'Nucleic Acids Res':        'Nucleic Acids Res.',
+      'PLoS Biol':                'PLOS Biol.',
+      'PLoS Comput Biol':         'PLOS Comput. Biol.',
+      'Proc Natl Acad Sci U S A': 'Proc. Natl. Acad. Sci. USA',
+      }
+   if s in journal_map: return journal_map[s]
+   else:                return s
+   
+
+
+# Main body.
+# Get the XML text with urllib.request;
+# parse it with xml.etree.ElementTree.
+#
+# To see the XML that's being parsed, go to a browser with e.g.
+#   https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id=13882203&rettype=abstract
+#
+with urllib.request.urlopen(efetch_url) as response:
+   body = response.read()
+   root = ET.fromstring(body)
+
+   PubmedArticle = root.find('PubmedArticle')
+   authors  = []
+   for Author in PubmedArticle.iter('Author'):
+      author_surname  = format_author_surname (Author.find('LastName').text)
+      author_initials = format_author_initials(Author.find('Initials').text)
+      authors.append('{} {}'.format(author_initials, author_surname))
+
+   title      = PubmedArticle.find('./MedlineCitation/Article/ArticleTitle').text
+   journal    = PubmedArticle.find('./MedlineCitation/Article/Journal/ISOAbbreviation').text
+   volume     = PubmedArticle.find('./MedlineCitation/Article/Journal/JournalIssue/Volume').text
+   year       = PubmedArticle.find('./MedlineCitation/Article/Journal/JournalIssue/PubDate/Year').text
+
+   # For single "page numbers" that are really an e-identifier, they can either
+   # appear as an "ELocationID" of type "pii", or a StartPage without an EndPage.
+   if PubmedArticle.find('./MedlineCitation/Article/Pagination'):
+      page_start = PubmedArticle.find('./MedlineCitation/Article/Pagination/StartPage')
+      page_end   = PubmedArticle.find('./MedlineCitation/Article/Pagination/EndPage')
+      if page_end != None: pages = '{}--{}'.format(page_start.text, page_end.text)
+      else:                pages = '{}'.format(page_start.text)
+   else:
+      for eloc in PubmedArticle.findall('./MedlineCitation/Article/ELocationID'):
+         if (eloc.get('EIdType') == 'pii'): pages = eloc.text
+
+   idlist = PubmedArticle.find('./PubmedData/ArticleIdList')
+   pmcid  = None
+   doi    = None
+   for id in idlist.findall('ArticleId'):
+      if   (id.get('IdType') == 'pmc'):   pmcid = id
+      elif (id.get('IdType') == 'doi'):   doi   = id
+
+   print ('@Article{CITEKEY,')
+   print ('  author     = {{{}}},'.format(' and '.join(authors)))
+   print ('  title      = {{{}}},'.format(format_title(title)))
+   print ('  journal    = {{{}}},'.format(format_journal(journal)))
+   print ('  year       = {},'.format(year))
+   print ('  volume     = {},'.format(volume))
+   print ('  pages      = {{{}}},'.format(pages))
+   print ('  pmid       = {},'.format(pmid))   
+   if pmcid != None: print ('  pmcid      = {{{}}},'.format(pmcid.text))
+   if doi   != None: print ('  reprinturl = {{https://doi.org/{}}},'.format(doi.text))
+   print ('}')
+ 
